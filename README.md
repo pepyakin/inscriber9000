@@ -18,7 +18,8 @@ Usage:
 inscriber9000 \
     --private-key <your private key> \
     --chain=kusama \
-    --remark='{"p":"ksm-20","op":"mint","tick":"sama","amt":"1000"}'`
+    --remark='{"p":"ksm-20","op":"mint","tick":"sama","amt":"1000"}'` \
+    --inflight-num=100
 ```
 
 To obtain your private key, you can use the `subkey` tool:
@@ -37,5 +38,6 @@ Alternatively, you could check out the repo and run it with cargo:
 cargo run \
     --private-key <your private key> \
     --chain=kusama \
-    --remark='{"p":"ksm-20","op":"mint","tick":"sama","amt":"1000"}'`
+    --remark='{"p":"ksm-20","op":"mint","tick":"sama","amt":"1000"}'` \
+    --inflight-num=100
 ```

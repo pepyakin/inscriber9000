@@ -1,11 +1,12 @@
+use std::sync::Arc;
+
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
-use subxt::tx::Signer;
+use metadata::kusama::system::calls::types::RemarkWithEvent;
+use subxt::tx::{Payload, Signer};
 use subxt_signer::sr25519::{Keypair, Seed};
 
 mod metadata;
-
-
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -18,6 +19,9 @@ struct Cli {
     remark: String,
     #[clap(long, required = true)]
     chain: String,
+    /// Specifies how many transactions to fill the mempool with.
+    #[clap(long, short = 'n', default_value = "100")]
+    inflight_num: usize,
 }
 
 impl Cli {
@@ -55,27 +59,68 @@ async fn main() -> Result<()> {
 
     // first CLI stuff. Ensure it's all correct.
     cli.ensure_kusama()?;
-    let keypair = cli.private_key()?;
-    
+    let keypair = Arc::new(cli.private_key()?);
+
     println!("remark: {}", &cli.remark);
 
     let endpoint = metadata::kusama::pick_endpoint(cli.endpoint.as_deref());
     println!("connecting to {}", &endpoint);
     let client = metadata::kusama::new_client(endpoint).await?;
     let remark = cli.remark.as_bytes().to_vec();
-    let xt = metadata::kusama::tx().system().remark_with_event(remark);
     let mut nonce = client
         .tx()
         .account_nonce(&<subxt_signer::sr25519::Keypair as Signer<
             metadata::kusama::Config,
         >>::account_id(&keypair))
         .await?;
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(cli.inflight_num));
     loop {
-        let tx = client
-            .tx()
-            .create_signed_with_nonce(&xt, &keypair, nonce, Default::default())?;
-        let extrinsic_hash = tx.submit_and_watch().await?.wait_for_finalized().await?.extrinsic_hash();
-        println!("{}: {:?}", nonce, extrinsic_hash);
+        tokio::spawn({
+            let permit = semaphore.clone().acquire_owned().await;
+            let client = client.clone();
+            let xt = metadata::kusama::tx()
+                .system()
+                .remark_with_event(remark.clone());
+            let keypair = keypair.clone();
+            async move {
+                // move permit in.
+                let _permit = permit;
+                do_it(&client, nonce, &xt, &keypair)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("{}: {:?}", nonce, e);
+                    });
+
+                async fn do_it(
+                    client: &metadata::kusama::Client,
+                    nonce: u64,
+                    xt: &Payload<RemarkWithEvent>,
+                    keypair: &Keypair,
+                ) -> Result<()> {
+                    let tx = client.tx().create_signed_with_nonce(
+                        xt,
+                        keypair,
+                        nonce,
+                        Default::default(),
+                    )?;
+                    let mut tx_status = tx.submit_and_watch().await?;
+                    while let Some(status) = tx_status.next().await {
+                        let status = status?;
+                        match status {
+                            subxt::tx::TxStatus::InBestBlock(tx)
+                            | subxt::tx::TxStatus::InFinalizedBlock(tx) => {
+                                let extrinsic_hash = tx.extrinsic_hash();
+                                println!("{}: {:?}", nonce, extrinsic_hash);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        });
         nonce += 1;
     }
 }

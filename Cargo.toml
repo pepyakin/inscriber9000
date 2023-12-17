@@ -1,6 +1,6 @@
 [package]
 name = "inscriber9000"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 exclude = ["README.md"]
 repository = "https://github.com/pepyakin/inscriber9000"
@@ -16,7 +16,7 @@ hex = "0.4.3"
 rand = "0.8.5"
 subxt = { version = "0.33.0", features = ["jsonrpsee"] }
 subxt-signer = "0.33.0"
-tokio = { version = "1.35.0", features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1.35.0", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 
 [profile.dev]
 debug = 0
