@@ -3,6 +3,9 @@
 inscriber 9000 serves all your inscribing needs. It will take whatever you want to inscribe, sign
 it with your private key, and then send it to the chain.
 
+> [!CAUTION]
+> You are going to lose your funds. Use at your own risk.
+
 ## Getting Started
 
 To install you need to have rust installed. (See https://rustup.rs/). Then you can install
