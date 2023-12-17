@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
-use subxt::tx::{Signer, TxPayload};
+use subxt::{
+    config::substrate::H256,
+    tx::{Signer, TxPayload},
+};
 use subxt_signer::{
     sr25519::{Keypair, Seed},
     DeriveJunction,
@@ -87,17 +90,6 @@ impl Database {
         Ok(value)
     }
 
-    pub async fn get_pending_txns(&self) -> Result<Vec<Txn>> {
-        let rows = sqlx::query!("SELECT extrinsic_data FROM txns")
-            .fetch_all(&self.sqlite)
-            .await?;
-        let txns = rows
-            .into_iter()
-            .map(|row| Txn(row.extrinsic_data))
-            .collect();
-        Ok(txns)
-    }
-
     pub async fn update(&self, new_next_index: u32, txns: Vec<Txn>) -> Result<()> {
         let mut tx = self.sqlite.begin().await?;
         sqlx::query!(
@@ -117,12 +109,20 @@ impl Database {
 }
 
 struct AccountState {
+    index: Option<u32>,
     keypair: Keypair,
     nonce: u64,
 }
 
 #[derive(Clone)]
 struct Txn(Vec<u8>);
+
+impl Txn {
+    pub fn hash(&self) -> H256 {
+        use subxt::config::Hasher;
+        <metadata::kusama::Config as subxt::Config>::Hasher::hash_of(&self.0)
+    }
+}
 
 #[derive(Clone)]
 struct Rpc {
@@ -152,9 +152,19 @@ impl Rpc {
         Ok(Txn(signed.into_encoded()))
     }
 
-    pub async fn submit(&self, txn: Txn) -> Result<()> {
-        let _ = self.client.backend().submit_transaction(&txn.0).await?;
-        Ok(())
+    pub async fn submit(&self, txn: Txn) -> Result<H256> {
+        let mut progress = self.client.backend().submit_transaction(&txn.0).await?;
+        while let Some(status) = progress.next().await {
+            let status = status?;
+            match status {
+                subxt::backend::TransactionStatus::InBestBlock { hash }
+                | subxt::backend::TransactionStatus::InFinalizedBlock { hash } => {
+                    return Ok(hash.hash())
+                }
+                _ => (),
+            }
+        }
+        bail!("Transaction failed")
     }
 }
 
@@ -175,40 +185,6 @@ fn sign_mint(rpc: &Rpc, minter: &AccountState, remark: Vec<u8>) -> Result<Txn> {
     Ok(signed)
 }
 
-fn sign_transfer_and_mint(
-    rpc: &Rpc,
-    prev: &AccountState,
-    next: &AccountState,
-    remark: Vec<u8>,
-) -> Result<Vec<Txn>> {
-    Ok(vec![
-        sign_transfer_all(rpc, prev, next)?,
-        sign_mint(rpc, next, remark)?,
-    ])
-}
-
-/// The service that makes sure that it keeps the mempool filled with transactions.
-struct SubmissionService {
-    semaphore: tokio::sync::Semaphore,
-    rpc: Rpc,
-}
-
-impl SubmissionService {
-    pub fn new(inflight_num: usize, rpc: Rpc) -> Self {
-        Self {
-            semaphore: tokio::sync::Semaphore::new(inflight_num),
-            rpc,
-        }
-    }
-
-    /// Blocks until there is a slot available in the mempool.
-    pub async fn submit(&self, txn: Txn) -> Result<()> {
-        let _permit = self.semaphore.acquire().await;
-        self.rpc.submit(txn).await?;
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -225,40 +201,55 @@ async fn main() -> Result<()> {
     let remark = Arc::new(cli.remark.as_bytes().to_vec());
 
     let db = Database::new().await?;
-    let submission_service = SubmissionService::new(cli.inflight_num, rpc.clone());
-    let pending = db.get_pending_txns().await?;
-
-    // This will block and thus can lead to a dead lock if we don't purge submission service.
-    for txn in pending {
-        submission_service.submit(txn).await?;
-    }
-
     let mut index = db.get_next_index().await?;
     loop {
         let prev = if index == 0 {
             // first time, use the root keypair. Request the nonce.
             let keypair = Keypair::clone(&root_keypair);
             let nonce = rpc.get_nonce(&keypair).await?;
-            AccountState { keypair, nonce }
+            AccountState {
+                keypair,
+                nonce,
+                index: None,
+            }
         } else {
             // otherwise, derive the keypair from the previous one. The nonce must be 1 because the
             // previous account should've submitted the mint transaction.
             let keypair = derive_account(&root_keypair, index - 1);
-            AccountState { keypair, nonce: 1 }
+            AccountState {
+                keypair,
+                nonce: 1,
+                index: Some(index - 1),
+            }
         };
         let next = {
             // Next always has nonce 0.
             let keypair = derive_account(&root_keypair, index);
-            AccountState { keypair, nonce: 0 }
+            AccountState {
+                keypair,
+                nonce: 0,
+                index: Some(index),
+            }
         };
-        let txns = sign_transfer_and_mint(&rpc, &prev, &next, Vec::clone(&remark))?;
 
+        // Sign the transfer_all from the previous account to the next account.
+        // Saves the transaction to the database. We also bump the index of the used account!
+        println!("signing transfer_all from {:?} to {:?}", prev.index, next.index);
+        println!("nonce: {}", prev.nonce);
+        let xfer = sign_transfer_all(&rpc, &prev, &next)?;
+        println!("hash: {:?}", xfer.hash());
         index += 1;
-        db.update(index, txns.clone()).await?;
+        db.update(index, vec![xfer.clone()]).await?;
+        rpc.submit(xfer).await?;
 
-        for txn in txns {
-            tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
-            submission_service.submit(txn).await?;
-        }
+        // Sign the mint transaction from the next account. Saves the it into the database without
+        // changing the index.
+        println!("signing mint from {:?}", next.index);
+        let mint = sign_mint(&rpc, &next, Vec::clone(&remark))?;
+        println!("hash: {:?}", mint.hash());
+        db.update(index, vec![mint.clone()]).await?;
+        let tx_hash = rpc.submit(mint).await?;
+
+        println!("submitted tx: {:?}", tx_hash);
     }
 }
