@@ -5,13 +5,13 @@ use subxt_signer::sr25519::{Keypair, Seed};
 
 mod metadata;
 
-const DEFAULT_ENDPOINT: &str = "wss://kusama.api.onfinality.io/public-ws";
+
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    #[clap(long, default_value = DEFAULT_ENDPOINT)]
-    endpoint: String,
+    #[clap(long)]
+    endpoint: Option<String>,
     #[clap(long, required = true)]
     private_key: String,
     #[clap(long, required = true)]
@@ -56,11 +56,12 @@ async fn main() -> Result<()> {
     // first CLI stuff. Ensure it's all correct.
     cli.ensure_kusama()?;
     let keypair = cli.private_key()?;
-    let endpoint = cli.endpoint;
-
+    
     println!("remark: {}", &cli.remark);
 
-    let client = metadata::kusama::Client::from_url(&endpoint).await?;
+    let endpoint = metadata::kusama::pick_endpoint(cli.endpoint.as_deref());
+    println!("connecting to {}", &endpoint);
+    let client = metadata::kusama::new_client(endpoint).await?;
     let remark = cli.remark.as_bytes().to_vec();
     let xt = metadata::kusama::tx().system().remark_with_event(remark);
     let mut nonce = client
